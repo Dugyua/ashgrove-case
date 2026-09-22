@@ -19,8 +19,11 @@ const { URL } = require("url");
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "demo-secret-change-me";
 const PORT = process.env.PORT || 3000;
 // Sonuç kodu bu süre içinde hiç gelmezse çağrı "belirsiz" statüsüne düşer
-// ve insan onay kuyruğuna işaretlenir (demo hızlı görünsün diye 20 sn).
-const NO_DISPOSITION_TIMEOUT_MS = 20 * 1000;
+// ve insan onay kuyruğuna işaretlenir. Vaka dosyası disposition'ın normal
+// şartlarda 12-40 sn arasında gelebileceğini belirtiyor; zaman aşımını 45 sn
+// tutuyoruz ki gerçekten geç kalmış (ama gelen) bir disposition yanlışlıkla
+// "hiç gelmedi" diye işaretlenmesin.
+const NO_DISPOSITION_TIMEOUT_MS = 45 * 1000;
 
 // ---------------------------------------------------------------
 // In-memory "veritabanı" (demo amaçlı — gerçek projede Postgres/Redis)
@@ -37,20 +40,39 @@ const db = {
   contactIdByCallId: {},
 };
 
+const DEMO_PATIENT_NAMES = [
+  "Jane Doe", "Robert Fitzgerald", "Amara Okafor", "Liam Chen", "Priya Nair",
+  "Tomasz Kowalski", "Grace Whitfield", "Mateo Alvarez", "Nadia Petrov", "Ewan MacLeod",
+];
+
 function seedDemoData() {
-  const contactId = "HS-88214";
-  const dealId = "DEAL-88214";
-  db.contacts[contactId] = { id: contactId, name: "Jane Doe (demo hasta)" };
-  db.deals[dealId] = {
-    id: dealId,
-    contact_id: contactId,
-    dealstage: "new_lead",
-    lastmodifieddate: new Date().toISOString(),
-    history: [],
-  };
-  db.contactIdByCallId["CL-2609-3318"] = contactId;
+  DEMO_PATIENT_NAMES.forEach((name, i) => {
+    const n = String(i + 1).padStart(3, "0");
+    const contactId = "HS-882" + n;
+    const dealId = "DEAL-882" + n;
+    db.contacts[contactId] = { id: contactId, name: `${name} (demo hasta)` };
+    db.deals[dealId] = {
+      id: dealId,
+      contact_id: contactId,
+      dealstage: "new_lead",
+      lastmodifieddate: new Date().toISOString(),
+      history: [],
+    };
+  });
+  db.contactIdByCallId["CL-2609-3318"] = "HS-882001";
+  db._demoPoolIndex = 0; // her demo senaryosu bir sonraki hastayı kullanır
 }
 seedDemoData();
+
+// Her /demo/scenario çağrısında havuzdaki bir SONRAKİ hastayı döndürür,
+// böylece her tetikleme farklı bir kayıt üzerinde çalışır ve dashboard'daki
+// sayılar her Send'de gerçekten artar (tek bir hasta üzerinde döngü yerine).
+function nextDemoContact() {
+  const ids = Object.keys(db.contacts);
+  const id = ids[db._demoPoolIndex % ids.length];
+  db._demoPoolIndex++;
+  return id;
+}
 
 function findDealByContactId(contactId) {
   return Object.values(db.deals).find((d) => d.contact_id === contactId);
@@ -77,11 +99,29 @@ const CODE_TO_STAGE = {
 };
 
 function reconcile(event) {
-  const call = db.calls[event.call_id] || { call_id: event.call_id };
+  const existing = db.calls[event.call_id];
+
+  // Sıra garantisi yok: disposition.selected, call.ended'dan ÖNCE gelebilir.
+  // Bu durumda deal'i eşleştirecek crm_contact_id henüz yok — kayıp değil,
+  // sadece sırası ters; call.ended gelince otomatik tamamlanacak.
+  if (!existing) {
+    db.calls[event.call_id] = {
+      call_id: event.call_id,
+      status: "disposition_before_call_ended",
+      finish_code: event.finish_code,
+      agent_note: event.agent_note || null,
+      disposition_at: event.occurred_at,
+      pendingEvent: event,
+    };
+    return;
+  }
+
+  const call = existing;
   call.finish_code = event.finish_code;
   call.agent_note = event.agent_note || null;
   call.disposition_at = event.occurred_at;
   call.status = "disposition_received";
+  call.pendingEvent = null;
   db.calls[event.call_id] = call;
 
   const contactId = call.crm_contact_id || db.contactIdByCallId[event.call_id];
@@ -171,6 +211,27 @@ function crmPatchDeal(id, body) {
   return { status: result.status, body: result.deal || deal };
 }
 
+// call.ended kaydını oluşturur/günceller. Eğer bu call_id için disposition
+// daha ÖNCE gelmiş ve bekletiliyorsa (sıra garantisi yok), onu şimdi
+// tamamlar ve reconcile'ı tetikler.
+function recordCallEnded(callId, crmContactId, occurredAt) {
+  const existing = db.calls[callId];
+  const earlyDisposition = existing && existing.status === "disposition_before_call_ended" ? existing : null;
+
+  db.calls[callId] = {
+    call_id: callId,
+    crm_contact_id: crmContactId,
+    status: "awaiting_disposition",
+    call_ended_at: occurredAt,
+    finish_code: earlyDisposition ? earlyDisposition.finish_code : null,
+    agent_note: earlyDisposition ? earlyDisposition.agent_note : null,
+  };
+
+  if (earlyDisposition && earlyDisposition.pendingEvent) {
+    reconcile(earlyDisposition.pendingEvent);
+  }
+}
+
 function deliverWebhook(event) {
   if (db.processedEventIds.has(event.event_id) && event.__forceRedeliver !== true) {
     return { duplicate: true };
@@ -221,22 +282,22 @@ function emit(type, body) {
   };
   db.events.push(event);
   if (type === "call.ended") {
-    db.calls[body.call_id] = {
-      call_id: body.call_id,
-      crm_contact_id: body.crm_contact_id,
-      status: "awaiting_disposition",
-      call_ended_at: event.occurred_at,
-      finish_code: null,
-      agent_note: null,
-    };
+    recordCallEnded(body.call_id, body.crm_contact_id, event.occurred_at);
   }
   deliverWebhook(event);
   return event;
 }
 
+function emitOutOfOrder(callId, contactId) {
+  // "sıra garantisi yok" özelliğini birebir gösterir: disposition,
+  // call.ended'dan ÖNCE teslim edilir.
+  emit("disposition.selected", { call_id: callId, finish_code: "CONSULTATION_BOOKED", agent_note: "booked (sıra dışı teslimat)" });
+  emit("call.ended", { call_id: callId, crm_contact_id: contactId });
+}
+
 function runScenario(name, res) {
   const callId = "CL-DEMO-" + Date.now();
-  const contactId = "HS-88214";
+  const contactId = nextDemoContact(); // her tetiklemede farklı bir hasta
 
   switch (name) {
     case "clean-flow":
@@ -253,6 +314,10 @@ function runScenario(name, res) {
     case "note-conflict":
       emit("call.ended", { call_id: callId, crm_contact_id: contactId });
       emit("disposition.selected", { call_id: callId, finish_code: "NO_ANSWER", agent_note: "spoke to her, she's booking online herself tonight" });
+      break;
+    case "out-of-order":
+      // "sıra garantisi yok": disposition, call.ended'dan ÖNCE gelir.
+      emitOutOfOrder(callId, contactId);
       break;
     case "duplicate-event": {
       // Vakadaki tanım: AYNI call_id, FARKLI event_id (platformun aynı
@@ -271,7 +336,7 @@ function runScenario(name, res) {
       // 2) Nadia'nın ekibi TAM O SIRADA deal'i CRM üzerinden elle taşır.
       // 3) Reconciliation motoru elindeki ESKİ tarihle PATCH dener -> 409.
       // 4) Taze veriyle tekrar dener -> başarılı.
-      const dealId = "DEAL-88214";
+      const dealId = findDealByContactId(contactId).id;
       const dealBefore = db.deals[dealId];
       const staleLastMod = dealBefore.lastmodifieddate; // reconciliation'ın "okuduğu" an
 
@@ -311,7 +376,7 @@ function runScenario(name, res) {
     default:
       sendJSON(res, 404, {
         error: "bilinmeyen senaryo",
-        available: ["clean-flow", "no-disposition", "late-disposition", "note-conflict", "duplicate-event", "conflict-409"],
+        available: ["clean-flow", "no-disposition", "late-disposition", "note-conflict", "duplicate-event", "conflict-409", "out-of-order"],
       });
       return;
   }
@@ -376,7 +441,7 @@ const server = http.createServer(async (req, res) => {
       };
       if (type === "call.ended") {
         Object.assign(event, { crm_contact_id: crm_contact_id || null, talk_time_sec: 96, finish_code: null });
-        db.calls[call_id] = { call_id, agent_id: event.agent_id, crm_contact_id: event.crm_contact_id, status: "awaiting_disposition", call_ended_at: event.occurred_at, finish_code: null, agent_note: null };
+        recordCallEnded(call_id, event.crm_contact_id, event.occurred_at);
       } else if (type === "disposition.selected") {
         Object.assign(event, { finish_code: finish_code || null, agent_note: agent_note || null });
       } else {
@@ -408,6 +473,14 @@ const server = http.createServer(async (req, res) => {
       const id = path.split("/").pop();
       const c = db.contacts[id];
       return c ? sendJSON(res, 200, c) : sendJSON(res, 404, { error: "not found" });
+    }
+    if (path.match(/^\/crm\/objects\/contacts\/[^/]+$/) && method === "PATCH") {
+      const id = path.split("/").pop();
+      const c = db.contacts[id];
+      if (!c) return sendJSON(res, 404, { error: "not found" });
+      const body = await readBody(req);
+      Object.assign(c, body, { id }); // id değiştirilemez
+      return sendJSON(res, 200, c);
     }
     if (path.match(/^\/crm\/objects\/deals\/[^/]+$/) && method === "GET") {
       const id = path.split("/").pop();
@@ -442,15 +515,20 @@ const server = http.createServer(async (req, res) => {
     // ---- DASHBOARD ----
     if (path === "/dashboard" && method === "GET") {
       const pending = Object.values(db.calls).filter((c) => c.status === "awaiting_disposition").length;
+      const totalPatients = Object.keys(db.contacts).length;
+      const stillNewLead = Object.values(db.deals).filter((d) => d.dealstage === "new_lead").length;
       return sendHTML(
         res,
         200,
         `<!doctype html><html><head><meta charset="utf-8"><title>Ashgrove Dashboard</title>
+        <meta http-equiv="refresh" content="3">
         <style>body{font-family:system-ui;max-width:760px;margin:40px auto;color:#141413}
         .card{border:1px solid #ddd;border-radius:8px;padding:16px;margin-bottom:14px}
         table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #eee;padding:6px;text-align:left;font-size:13px}
         </style></head><body>
         <h1>Ashgrove — Reconciliation Dashboard</h1>
+        <p style="color:#888;font-size:12px">3 saniyede bir otomatik yenilenir</p>
+        <div class="card"><b>Toplam demo hastası:</b> ${totalPatients} &nbsp;|&nbsp; <b>Hâlâ New Lead'de:</b> ${stillNewLead} &nbsp;|&nbsp; <b>İşlenmiş:</b> ${totalPatients - stillNewLead}</div>
         <div class="card"><b>Sonuç kodu bekleyen çağrı:</b> ${pending}</div>
         <div class="card"><b>Bastırılan (randevulu) deal sayısı:</b> ${db.suppressed.size}</div>
         <div class="card"><b>İnsan onayı bekleyen kayıt:</b> ${db.reviewQueue.length}
